@@ -1,6 +1,6 @@
 # WSL2 Webcam & WebGL2 in Linux Google Chrome: Complete Setup, Architecture & Incident History
 
-> This guide details how to configure Windows 11 and WSL2 (Ubuntu 24.04, Linux kernel 6.x) so that Linux-native Google Chrome can access your laptop's built-in or USB webcam via `/dev/video0` with continuous 30 FPS video, and run hardware/safe WebGL 2.0 for **Google Meet background blur and visual effects** without any risk of system lockups or crashes.
+> This guide details how to configure Windows 11 and WSL2 (Ubuntu 24.04, Linux kernel 6.x) so that Linux-native Google Chrome can access your laptop's built-in or USB webcam via `/dev/video0` with continuous 30 FPS video, and run safe userspace WebGL 2.0 (via SwiftShader) for **Google Meet background blur and visual effects** without any risk of system lockups or crashes.
 
 ---
 
@@ -330,7 +330,7 @@ pkill -9 -f chrome || true
 # 2. Set display and software rendering safety guards
 export DISPLAY=:0
 export WAYLAND_DISPLAY=wayland-0
-export XDG_RUNTIME_DIR=/run/user/1000
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
 export LIBGL_ALWAYS_SOFTWARE=1
 export LD_PRELOAD=/usr/local/lib/libv4l2_fix.so
 
@@ -379,12 +379,12 @@ When you are finished using the webcam in WSL2 and want to return it completely 
 ## 2. Appendix: Complete Investigation History & Safety Post-Mortem
 
 ### Phase 1: The Initial Webcam Failure
-* **Symptoms**: When launching standard Chrome, `https://webcamtests.com` reported *"Could not find a web camera"*, while terminal logged endless errors:
+- **Symptoms**: When launching standard Chrome, `https://webcamtests.com` reported *"Could not find a web camera"*, while terminal logged endless errors:
   ```text
   [ERROR:media/capture/video/linux/v4l2_capture_delegate.cc:1137] Dequeued v4l2 buffer contains corrupted data (29504 bytes).
   [ERROR:media/capture/video/linux/v4l2_capture_delegate.cc:1137] Dequeued v4l2 buffer contains corrupted data (460800 bytes).
   ```
-* **Discovery**:
+- **Discovery**:
   - Logitech C270 advertises `[0]: YUYV (raw)` and `[1]: MJPG (compressed)`.
   - Chromium hardcodes a preference for uncompressed `YUYV` at 640×480.
   - Raw `YUYV` generates **147.5 Mbps (18.4 MB/s)** of constant isochronous USB traffic. The virtual USB/IP bridge dropped microframes, causing the kernel driver to set `V4L2_BUF_FLAG_ERROR` on the buffer.
@@ -394,11 +394,11 @@ When you are finished using the webcam in WSL2 and want to return it completely 
 ---
 
 ### Phase 2: The x86_64 32-bit `ioctl` Sign Extension Bug
-* **Symptoms**: Writing an initial `ioctl` hook to clear `V4L2_BUF_FLAG_ERROR` did nothing—the errors persisted verbatim.
-* **Root Cause**:
+- **Symptoms**: Writing an initial `ioctl` hook to clear `V4L2_BUF_FLAG_ERROR` did nothing—the errors persisted verbatim.
+- **Root Cause**:
   `VIDIOC_DQBUF` evaluates to `0xc0585611`. Because the highest bit (bit 31) is set, when Chromium calls `ioctl()` with a 32-bit integer, x86_64 register `%rsi` sign-extends it to `0xffffffffc0585611`.
   Comparing `request == VIDIOC_DQBUF` failed because `0xffffffffc0585611 != 0x00000000c0585611`.
-* **Fix**: Mask all `ioctl` request codes with `& 0xFFFFFFFFUL`:
+- **Fix**: Mask all `ioctl` request codes with `& 0xFFFFFFFFUL`:
   ```c
   unsigned long cmd = request & 0xFFFFFFFFUL;
   if (cmd == (VIDIOC_DQBUF & 0xFFFFFFFFUL)) { ... }
@@ -407,16 +407,16 @@ When you are finished using the webcam in WSL2 and want to return it completely 
 ---
 
 ### Phase 3: The Single-Frame Flash & URB Teardown Race
-* **Symptoms**: The buffer error disappeared, but only a single picture flashed on screen before freezing. Checking `dmesg` revealed:
+- **Symptoms**: The buffer error disappeared, but only a single picture flashed on screen before freezing. Checking `dmesg` revealed:
   ```text
   vhci_hcd: unlink->seqnum 14176
   vhci_hcd: urb->status -104 (-ECONNRESET)
   ```
-* **Root Cause**:
+- **Root Cause**:
   1. `webcamtests.com` and WebRTC probe streams start by capturing 1 frame, immediately stopping via `track.stop()` (`VIDIOC_STREAMOFF`), and restarting.
   2. In `vhci_hcd.c`, `VIDIOC_STREAMOFF` asynchronously cancels URBs. Restarting immediately caused a race with `usbipd-win` on Windows, stalling the isochronous endpoint.
   3. Linux `vhci_get_frame_number()` is an unimplemented stub returning `0`, flooding `dmesg` and corrupting frame timestamps.
-* **Fix**:
+- **Fix**:
   1. Injected `usleep(150000)` (150ms cooldown) on `VIDIOC_STREAMOFF` to allow clean URB unlinking.
   2. Synthesized clean `CLOCK_MONOTONIC` timestamps on `VIDIOC_DQBUF`.
   3. Implemented frame caching: verified JPEG SOI (`FF D8`) and EOI (`FF D9`) markers; if a microframe dropped, substituted the last known valid JPEG so Chrome's decoder never halted.
@@ -452,12 +452,12 @@ chrome --ignore-gpu-blocklist --use-gl=angle --use-angle=gl ...
 
 Instead of touching `/dev/dxg` or the host GPU, we enabled **Chromium's bundled CPU SwiftShader** (`libvk_swiftshader.so`):
 
-* **Command Flags**:
+- **Command Flags**:
   ```bash
   export LIBGL_ALWAYS_SOFTWARE=1
   chrome --no-sandbox --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader ...
   ```
-* **Why This Works**:
+- **Why This Works**:
   1. **Zero Host Risk**: `lsof /dev/dxg` confirms nothing touches the Windows kernel graphics driver. All shaders execute as pure x86_64 CPU instructions within the Linux VM.
   2. **Passes Google Meet Requirements**: Unlike standard fallback modes, running ANGLE over SwiftShader with `--enable-unsafe-swiftshader` reports **`Major Performance Caveat: NO`** on `webglreport.com/?v=2`.
   3. **Full Functionality**: Google Meet's MediaPipe machine learning model runs smoothly, enabling real-time background blur and virtual effects while streaming the live 30 FPS webcam feed.
